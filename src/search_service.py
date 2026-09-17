@@ -20,11 +20,17 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
+import html
 from typing import List, Dict, Any, Optional, Tuple
 from itertools import cycle
-from urllib.parse import parse_qsl, unquote, urlparse
+from urllib.parse import parse_qs, parse_qsl, quote_plus, unquote, urlparse
+import xml.etree.ElementTree as ET
 import requests
-from newspaper import Article, Config
+try:
+    from newspaper import Article, Config
+except ImportError:
+    Article = None
+    Config = None
 from tenacity import (
     retry,
     stop_after_attempt,
@@ -205,6 +211,8 @@ def fetch_url_content(url: str, timeout: int = 5) -> str:
     """
     获取 URL 网页正文内容 (使用 newspaper3k)
     """
+    if Article is None or Config is None:
+        return ""
     try:
         # 配置 newspaper3k
         config = Config()
@@ -2220,6 +2228,383 @@ class SearXNGSearchProvider(BaseSearchProvider):
         )
 
 
+class BingNewsSearchProvider(BaseSearchProvider):
+    """
+    Bing News RSS search provider (free, zero-config, no API key required).
+
+    Fetches real-time financial news via Bing News RSS feed.
+    Directly accessible in mainland China without proxy.
+    Returns standard RFC 822 pubDate, which parses accurately in DSA.
+    """
+    DEFAULT_TIMEOUT_SECONDS = 8
+
+    def __init__(self, enabled: bool = True):
+        super().__init__(["free"] if enabled else [], "BingNews")
+        self._enabled = bool(enabled)
+
+    @property
+    def is_available(self) -> bool:
+        return self._enabled
+
+    def search(self, query: str, max_results: int = 5, days: int = 7, **kwargs: Any) -> SearchResponse:
+        """执行搜索"""
+        if not self.is_available:
+            return SearchResponse(
+                query=query,
+                results=[],
+                provider=self.name,
+                success=False,
+                error_message=f"{self.name} 未启用",
+            )
+        return self._execute_search(query, max_results=max_results, days=days, **kwargs)
+
+    @staticmethod
+    def _clean_html(raw_html: str) -> str:
+        """Strip HTML tags and unescape entities."""
+        if not raw_html:
+            return ""
+        text = re.sub(r"<[^>]+>", "", raw_html)
+        text = html.unescape(text)
+        return text.strip()
+
+    @staticmethod
+    def _extract_domain(url: str) -> str:
+        try:
+            parsed = urlparse(url)
+            domain = parsed.netloc.replace("www.", "")
+            return domain or "BingNews"
+        except Exception:
+            return "BingNews"
+
+    @staticmethod
+    def _clean_query(query: str) -> str:
+        """Strip generic news filler suffixes to avoid exact-match keyword over-filtering in RSS feed."""
+        cleaned = re.sub(
+            r"\s*(股票\s*最新消息|最新消息|股票|stock\s+latest\s+news|latest\s+news)\s*$",
+            "",
+            query.strip(),
+            flags=re.IGNORECASE,
+        ).strip()
+        return cleaned or query.strip()
+
+    def _do_search(
+        self,
+        query: str,
+        api_key: str,
+        max_results: int,
+        days: int = 7,
+        **kwargs: Any,
+    ) -> SearchResponse:
+        """Execute Bing News search via RSS feed."""
+        search_term = self._clean_query(query)
+        encoded_q = quote_plus(search_term)
+        url = f"https://www.bing.com/news/search?q={encoded_q}&format=rss"
+
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            ),
+            "Accept": "application/rss+xml, application/xml, text/xml;q=0.9, */*;q=0.8",
+        }
+        try:
+            resp = _get_with_retry(
+                url,
+                headers=headers,
+                params={},
+                timeout=self.DEFAULT_TIMEOUT_SECONDS,
+            )
+        except Exception as exc:
+            return SearchResponse(
+                query=query,
+                results=[],
+                provider=self.name,
+                success=False,
+                error_message=f"请求失败: {exc}",
+            )
+
+        if resp.status_code != 200:
+            return SearchResponse(
+                query=query,
+                results=[],
+                provider=self.name,
+                success=False,
+                error_message=f"HTTP {resp.status_code}",
+            )
+
+        try:
+            content = resp.content if isinstance(resp.content, (bytes, str)) else resp.text
+            root = ET.fromstring(content)
+        except ET.ParseError as exc:
+            return SearchResponse(
+                query=query,
+                results=[],
+                provider=self.name,
+                success=False,
+                error_message=f"XML解析失败: {exc}",
+            )
+
+        items = root.findall(".//item")
+        results: List[SearchResult] = []
+        for item in items:
+            title_elem = item.find("title")
+            link_elem = item.find("link")
+            desc_elem = item.find("description")
+            pub_date_elem = item.find("pubDate")
+
+            raw_title = title_elem.text if title_elem is not None and title_elem.text else ""
+            title = self._clean_html(raw_title)
+            if not title:
+                continue
+
+            raw_link = link_elem.text.strip() if link_elem is not None and link_elem.text else ""
+            if not raw_link:
+                continue
+
+            target_url = raw_link
+            try:
+                parsed_link = urlparse(raw_link)
+                if "apiclick" in parsed_link.path:
+                    query_params = parse_qs(parsed_link.query)
+                    target_url = query_params.get("url", [raw_link])[0]
+            except Exception:
+                target_url = raw_link
+
+            raw_desc = desc_elem.text if desc_elem is not None and desc_elem.text else ""
+            snippet = self._clean_html(raw_desc)[:500]
+
+            raw_pub_date = (
+                pub_date_elem.text.strip()
+                if pub_date_elem is not None and pub_date_elem.text
+                else None
+            )
+            published_date = None
+            if raw_pub_date:
+                try:
+                    dt = parsedate_to_datetime(raw_pub_date)
+                    published_date = dt.strftime("%Y-%m-%d")
+                except Exception:
+                    published_date = raw_pub_date
+
+            source = ""
+            for child in item:
+                if child.tag.endswith("Source") and child.text:
+                    source = child.text.strip()
+                    break
+            if not source:
+                source = self._extract_domain(target_url)
+
+            results.append(
+                SearchResult(
+                    title=title,
+                    snippet=snippet or title,
+                    url=target_url,
+                    source=source,
+                    published_date=published_date,
+                )
+            )
+            if len(results) >= max_results:
+                break
+
+        return SearchResponse(
+            query=query,
+            results=results,
+            provider=self.name,
+            success=True,
+        )
+
+
+class GoogleNewsSearchProvider(BaseSearchProvider):
+    """
+    Google News RSS search provider (free, zero-config, no API key required).
+
+    Fetches real-time financial news via Google News RSS feed.
+    Supports server-side time restriction via 'when:Xd' in query.
+    Directly accessible with proxy or in overseas environments (GitHub Actions / VPS).
+    """
+    DEFAULT_TIMEOUT_SECONDS = 8
+
+    def __init__(self, enabled: bool = True):
+        super().__init__(["free"] if enabled else [], "GoogleNews")
+        self._enabled = bool(enabled)
+
+    @property
+    def is_available(self) -> bool:
+        return self._enabled
+
+    def search(self, query: str, max_results: int = 5, days: int = 7, **kwargs: Any) -> SearchResponse:
+        """执行搜索"""
+        if not self.is_available:
+            return SearchResponse(
+                query=query,
+                results=[],
+                provider=self.name,
+                success=False,
+                error_message=f"{self.name} 未启用",
+            )
+        return self._execute_search(query, max_results=max_results, days=days, **kwargs)
+
+    @staticmethod
+    def _clean_html(raw_html: str) -> str:
+        """Strip HTML tags and unescape entities."""
+        if not raw_html:
+            return ""
+        text = re.sub(r"<[^>]+>", "", raw_html)
+        text = html.unescape(text)
+        return text.strip()
+
+    @staticmethod
+    def _extract_domain(url: str) -> str:
+        try:
+            parsed = urlparse(url)
+            domain = parsed.netloc.replace("www.", "")
+            return domain or "GoogleNews"
+        except Exception:
+            return "GoogleNews"
+
+    @staticmethod
+    def _resolve_locale(query: str) -> Tuple[str, str, str]:
+        """Determine hl, gl, ceid based on query language."""
+        if re.search(r"[\u3400-\u4dbf\u4e00-\u9fff]", query):
+            return "zh-CN", "CN", "CN:zh-Hans"
+        return "en-US", "US", "US:en"
+
+    @staticmethod
+    def _clean_query(query: str) -> str:
+        """Strip generic news filler suffixes to avoid exact-match keyword over-filtering in RSS feed."""
+        cleaned = re.sub(
+            r"\s*(股票\s*最新消息|最新消息|股票|stock\s+latest\s+news|latest\s+news)\s*$",
+            "",
+            query.strip(),
+            flags=re.IGNORECASE,
+        ).strip()
+        return cleaned or query.strip()
+
+    def _do_search(
+        self,
+        query: str,
+        api_key: str,
+        max_results: int,
+        days: int = 7,
+        **kwargs: Any,
+    ) -> SearchResponse:
+        """Execute Google News search via RSS feed."""
+        effective_query = self._clean_query(query)
+        if "when:" not in effective_query:
+            window_days = max(1, int(days))
+            effective_query = f"{effective_query} when:{window_days}d"
+
+        hl, gl, ceid = self._resolve_locale(query)
+        encoded_q = quote_plus(effective_query)
+        url = f"https://news.google.com/rss/search?q={encoded_q}&hl={hl}&gl={gl}&ceid={ceid}"
+
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            ),
+            "Accept": "application/rss+xml, application/xml, text/xml;q=0.9, */*;q=0.8",
+        }
+        try:
+            resp = _get_with_retry(
+                url,
+                headers=headers,
+                params={},
+                timeout=self.DEFAULT_TIMEOUT_SECONDS,
+            )
+        except Exception as exc:
+            return SearchResponse(
+                query=query,
+                results=[],
+                provider=self.name,
+                success=False,
+                error_message=f"请求失败: {exc}",
+            )
+
+        if resp.status_code != 200:
+            return SearchResponse(
+                query=query,
+                results=[],
+                provider=self.name,
+                success=False,
+                error_message=f"HTTP {resp.status_code}",
+            )
+
+        try:
+            content = resp.content if isinstance(resp.content, (bytes, str)) else resp.text
+            root = ET.fromstring(content)
+        except ET.ParseError as exc:
+            return SearchResponse(
+                query=query,
+                results=[],
+                provider=self.name,
+                success=False,
+                error_message=f"XML解析失败: {exc}",
+            )
+
+        items = root.findall(".//item")
+        results: List[SearchResult] = []
+        for item in items:
+            title_elem = item.find("title")
+            link_elem = item.find("link")
+            desc_elem = item.find("description")
+            pub_date_elem = item.find("pubDate")
+            source_elem = item.find("source")
+
+            raw_title = title_elem.text if title_elem is not None and title_elem.text else ""
+            title = self._clean_html(raw_title)
+            if not title:
+                continue
+
+            link = link_elem.text.strip() if link_elem is not None and link_elem.text else ""
+            if not link:
+                continue
+
+            source = ""
+            if source_elem is not None and source_elem.text:
+                source = source_elem.text.strip()
+            if not source:
+                source = self._extract_domain(link)
+
+            if source and title.endswith(f" - {source}"):
+                title = title[: -len(f" - {source}")].strip()
+
+            raw_desc = desc_elem.text if desc_elem is not None and desc_elem.text else ""
+            snippet = self._clean_html(raw_desc)[:500]
+
+            raw_pub_date = (
+                pub_date_elem.text.strip()
+                if pub_date_elem is not None and pub_date_elem.text
+                else None
+            )
+            published_date = None
+            if raw_pub_date:
+                try:
+                    dt = parsedate_to_datetime(raw_pub_date)
+                    published_date = dt.strftime("%Y-%m-%d")
+                except Exception:
+                    published_date = raw_pub_date
+
+            results.append(
+                SearchResult(
+                    title=title,
+                    snippet=snippet or title,
+                    url=link,
+                    source=source,
+                    published_date=published_date,
+                )
+            )
+            if len(results) >= max_results:
+                break
+
+        return SearchResponse(
+            query=query,
+            results=results,
+            provider=self.name,
+            success=True,
+        )
+
+
 class SearchService:
     """
     搜索服务
@@ -2390,6 +2775,8 @@ class SearchService:
         minimax_keys: Optional[List[str]] = None,
         searxng_base_urls: Optional[List[str]] = None,
         searxng_public_instances_enabled: bool = True,
+        bing_news_search_enabled: bool = False,
+        google_news_search_enabled: bool = False,
         news_max_age_days: int = 3,
         news_strategy_profile: str = "short",
     ):
@@ -2405,6 +2792,8 @@ class SearchService:
             minimax_keys: MiniMax API Key 列表
             searxng_base_urls: SearXNG 实例地址列表（自建无配额兜底）
             searxng_public_instances_enabled: 未配置自建实例时，是否自动使用公共 SearXNG 实例
+            bing_news_search_enabled: 是否启用 Bing News RSS 免费新闻搜索（免 Key）
+            google_news_search_enabled: 是否启用 Google News RSS 免费新闻搜索（免 Key）
             news_max_age_days: 新闻最大时效（天）
             news_strategy_profile: 新闻窗口策略档位（ultra_short/short/medium/long）
         """
@@ -2417,6 +2806,8 @@ class SearchService:
             "minimax_keys": list(minimax_keys or []),
             "searxng_base_urls": list(searxng_base_urls or []),
             "searxng_public_instances_enabled": bool(searxng_public_instances_enabled),
+            "bing_news_search_enabled": bool(bing_news_search_enabled),
+            "google_news_search_enabled": bool(google_news_search_enabled),
             "news_max_age_days": int(news_max_age_days),
             "news_strategy_profile": news_strategy_profile,
         }
@@ -2464,7 +2855,21 @@ class SearchService:
             self._providers.append(MiniMaxSearchProvider(minimax_keys))
             logger.info(f"已配置 MiniMax 搜索，共 {len(minimax_keys)} 个 API Key")
 
-        # 6. SearXNG（自建实例优先；未配置时可自动发现公共实例）
+        # 6. Bing News RSS（免 Key 免费新闻搜索，国内直连畅通）
+        if bing_news_search_enabled:
+            bing_provider = BingNewsSearchProvider(enabled=True)
+            if bing_provider.is_available:
+                self._providers.append(bing_provider)
+                logger.info("已启用 Bing News 免费新闻搜索（免 Key）")
+
+        # 7. Google News RSS（免 Key 免费新闻搜索，海外/代理直连）
+        if google_news_search_enabled:
+            google_provider = GoogleNewsSearchProvider(enabled=True)
+            if google_provider.is_available:
+                self._providers.append(google_provider)
+                logger.info("已启用 Google News 免费新闻搜索（免 Key）")
+
+        # 8. SearXNG（自建实例优先；未配置时可自动发现公共实例）
         searxng_provider = SearXNGSearchProvider(
             searxng_base_urls,
             use_public_instances=bool(searxng_public_instances_enabled and not searxng_base_urls),
@@ -2476,7 +2881,7 @@ class SearchService:
             else:
                 logger.info("已启用 SearXNG 公共实例自动发现模式")
 
-        # 7. Anspire Search（实时智能搜索优化）
+        # 9. Anspire Search（实时智能搜索优化）
         if anspire_keys:
             self._providers.insert(0, AnspireSearchProvider(anspire_keys))
             logger.info(f"已配置 Anspire Search 搜索，共 {len(anspire_keys)} 个 API Key")
@@ -4890,6 +5295,8 @@ def get_search_service() -> SearchService:
                     minimax_keys=config.minimax_api_keys,
                     searxng_base_urls=config.searxng_base_urls,
                     searxng_public_instances_enabled=config.searxng_public_instances_enabled,
+                    bing_news_search_enabled=getattr(config, "bing_news_search_enabled", True),
+                    google_news_search_enabled=getattr(config, "google_news_search_enabled", True),
                     news_max_age_days=config.news_max_age_days,
                     news_strategy_profile=getattr(config, "news_strategy_profile", "short"),
                 )

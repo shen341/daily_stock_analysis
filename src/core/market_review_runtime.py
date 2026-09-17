@@ -105,6 +105,16 @@ def build_market_review_runtime(
                 "searxng_public_instances_enabled",
                 True,
             ),
+            bing_news_search_enabled=getattr(
+                config,
+                "bing_news_search_enabled",
+                True,
+            ),
+            google_news_search_enabled=getattr(
+                config,
+                "google_news_search_enabled",
+                True,
+            ),
             news_max_age_days=getattr(config, "news_max_age_days", 3),
             news_strategy_profile=getattr(config, "news_strategy_profile", "short"),
         )

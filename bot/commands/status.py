@@ -110,6 +110,8 @@ class StatusCommand(BotCommand):
         status["search_serpapi"] = len(config.serpapi_keys) > 0
         status["search_minimax"] = len(config.minimax_api_keys) > 0
         status["search_searxng"] = config.has_searxng_enabled()
+        status["search_bing_news"] = getattr(config, "bing_news_search_enabled", True)
+        status["search_google_news"] = getattr(config, "google_news_search_enabled", True)
         
         # 通知渠道状态
         status["notify_wechat"] = bool(config.wechat_webhook_url)
@@ -187,6 +189,8 @@ class StatusCommand(BotCommand):
             f"• SerpAPI: {icon(status['search_serpapi'])}",
             f"• MiniMax: {icon(status['search_minimax'])}",
             f"• SearXNG: {icon(status['search_searxng'])}",
+            f"• Bing News: {icon(status['search_bing_news'])}",
+            f"• Google News: {icon(status['search_google_news'])}",
             "",
             "**📢 通知渠道**",
             f"• 企业微信: {icon(status['notify_wechat'])}",
